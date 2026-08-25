@@ -6,6 +6,12 @@
             </div>
         @endif
 
+        @if (! $botRunning && ! $botStopping)
+            <div class="mb-4 p-3 rounded-lg text-sm bg-slate-800/60 border border-slate-700 text-slate-300">
+                ⏸ <strong class="text-white">Bot STOPPED</strong> — koi scan/trade nahi ho rahi. Open positions (agar hain) exchange pe waisi hain, unki monitoring band hai. Chalu karne ke liye ▶ Start Bot dabao.
+            </div>
+        @endif
+
         <header class="flex items-center justify-between mb-8">
             <div class="flex items-center gap-3">
                 <span class="text-2xl">🤖</span>
@@ -21,18 +27,53 @@
             <div class="flex items-center gap-4">
                 <div class="flex items-center gap-2 text-sm">
                     <span class="relative flex h-3 w-3">
-                        @if ($healthy)
+                        @if ($botStopping)
+                            <span class="relative inline-flex rounded-full h-3 w-3 bg-amber-500"></span>
+                        @elseif ($botRunning && $healthy)
                             <span class="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-60"></span>
                             <span class="relative inline-flex rounded-full h-3 w-3 bg-emerald-500"></span>
+                        @elseif ($botRunning)
+                            <span class="relative inline-flex rounded-full h-3 w-3 bg-amber-400"></span>
                         @else
-                            <span class="relative inline-flex rounded-full h-3 w-3 bg-red-500"></span>
+                            <span class="relative inline-flex rounded-full h-3 w-3 bg-slate-600"></span>
                         @endif
                     </span>
-                    <span class="{{ $healthy ? 'text-emerald-400' : 'text-red-400' }} font-medium">
-                        {{ $healthy ? 'RUNNING' : 'DOWN' }}
+                    <span class="font-medium {{ $botStopping ? 'text-amber-400' : ($botRunning ? ($healthy ? 'text-emerald-400' : 'text-amber-400') : 'text-slate-400') }}">
+                        {{ $botStopping ? 'STOPPING…' : ($botRunning ? ($healthy ? 'RUNNING' : 'STARTING…') : 'STOPPED') }}
                     </span>
-                    <span class="text-slate-500">· last cycle {{ $lastCycle }}</span>
+                    @if ($botRunning)
+                        <span class="text-slate-500">· last cycle {{ $lastCycle }}</span>
+                    @endif
                 </div>
+
+                <button
+                    wire:click="scanNow"
+                    x-on:click="$el.classList.add('opacity-50','pointer-events-none'); $el.textContent='⏳ Scanning…'"
+                    class="px-4 py-2 rounded-lg text-sm font-semibold bg-sky-500/20 text-sky-300 border border-sky-400/40 hover:bg-sky-500 hover:text-white transition-colors">
+                    ⚡ Scan Now
+                </button>
+
+                @if ($botStopping)
+                    <button disabled class="px-4 py-2 rounded-lg text-sm font-semibold bg-slate-800 text-slate-500 border border-slate-700 cursor-not-allowed">
+                        ⏳ Stopping…
+                    </button>
+                @elseif ($botRunning)
+                    <button
+                        wire:click="stopBot"
+                        wire:confirm="Bot STOP karein? Open positions ki SL/TP monitoring bhi band ho jayegi!"
+                        wire:loading.attr="disabled"
+                        class="px-4 py-2 rounded-lg text-sm font-semibold bg-red-500/15 text-red-400 border border-red-500/30 hover:bg-red-500 hover:text-white transition-colors">
+                        ⏹ Stop Bot
+                    </button>
+                @else
+                    <button
+                        wire:click="startBot"
+                        wire:loading.attr="disabled"
+                        class="px-4 py-2 rounded-lg text-sm font-semibold bg-emerald-500/15 text-emerald-400 border border-emerald-500/30 hover:bg-emerald-500 hover:text-white transition-colors">
+                        ▶ Start Bot
+                    </button>
+                @endif
+
                 <a href="/settings" class="px-4 py-2 rounded-lg text-sm font-medium bg-slate-800 text-slate-300 border border-slate-700 hover:bg-slate-700 hover:text-white transition-colors">
                     ⚙️ Settings
                 </a>

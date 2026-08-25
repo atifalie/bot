@@ -23,6 +23,23 @@ class Trader
         return $this->exchange;
     }
 
+    /**
+     * Bybit server-clock ke sath dobara sync karo (10002 clock-skew errors pe).
+     * 1 min se bara implausible offset clamp ho jata hai — host clock NTP-synced.
+     */
+    public function resyncServerTime(): int
+    {
+        $diff = $this->exchange->load_time_difference();
+
+        if (abs($diff) > 60_000) {
+            $this->exchange->options['timeDifference'] = 0;
+
+            return 0;
+        }
+
+        return (int) $diff;
+    }
+
     public function ensureMarkets(): bool
     {
         if ($this->exchange->markets) {
@@ -292,6 +309,14 @@ class Trader
         $this->ensureMarkets();
 
         try {
+            // Quantity precision lagao — Bybit reject karta hai galat step size
+            $quantity = (float) $this->exchange->amount_to_precision($symbol, $quantity);
+            if ($quantity <= 0) {
+                Log::warning("[Trader] [{$symbol}] {$label} quantity rounded to zero — skip");
+
+                return ['status' => 'cancelled', 'filled' => 0];
+            }
+
             $params = $clientId ? [ExchangeManager::clientOrderIdParam($this->exchange->id) => $clientId] : [];
             Log::info(sprintf('[Trader] Placing %s: %.8f %s cid=%s', $label, $quantity, $symbol, $clientId ?? '-'));
 

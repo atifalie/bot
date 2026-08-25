@@ -69,6 +69,20 @@ class ExchangeManager
 
         $this->loadMarketsWithRetry($exchange);
 
+        // Sanity clamp: adjustForTimeDifference boot pe EK dafa calibrate hota
+        // hai aur phir cached rehta hai. Agar calibration ke waqt network
+        // hiccup thi to offset din bhar ke liye poison ho jata (28-din case).
+        // Host clock NTP se synced hai — 1 min se bara offset matlab galat
+        // calibration hai, local clock trust karo.
+        $diff = (int) ($exchange->options['timeDifference'] ?? 0);
+        if (abs($diff) > 60_000) {
+            Log::warning(sprintf(
+                '[ExchangeManager] implausible timeDifference %+.1fmin — resetting to 0 (local clock trusted)',
+                $diff / 60_000,
+            ));
+            $exchange->options['timeDifference'] = 0;
+        }
+
         return $exchange;
     }
 

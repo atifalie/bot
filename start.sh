@@ -49,13 +49,16 @@ REMAINING=$(pgrep -f "artisan bot:daemon|schedule:run" | grep -v "^$MYPID$" | wc
 echo "remaining after cleanup: $REMAINING"
 ' || true
 
-# ---------- 4) Vite (dashboard assets) ----------
+# ---------- 4) Dashboard assets (production build — vite dev-server NAHI) ----------
+# Styles ab static hain: public/build (npm run build ek dafa ho chuka hai).
+# Vite dev-server + public/hot yahan se HAMESHA ke liye hataye — warna har
+# start pe hot file ban jati thi aur CSS toot jati thi.
 docker exec dev sh -c 'pkill -f "vite" 2>/dev/null' || true
 docker exec dev sh -c 'rm -f /home/nodesol/public/hot'
-docker exec -d dev sh -c 'cd /home/nodesol && nohup npm run dev -- --host 0.0.0.0 --port 5174 --strictPort > /tmp/vite.log 2>&1'
-sleep 4
-# Hot file browser-friendly banao (0.0.0.0 browsers pe kaam nahi karta)
-docker exec dev sh -c 'echo -n "http://localhost:5174" > /home/nodesol/public/hot'
+if [ ! -f /home/atif/python/trade/bot/public/build/manifest.json ]; then
+    echo "🎨 Building dashboard assets (first time)..."
+    docker exec dev sh -c 'cd /home/nodesol && npm run build --silent'
+fi
 
 # ---------- 5) Bot START (streaming ya legacy scheduler) ----------
 STREAMING=$(docker exec dev sh -c 'grep -E "^BOT_STREAMING=" /home/nodesol/.env 2>/dev/null | cut -d= -f2 | tr -d "[:space:]"')
@@ -65,8 +68,9 @@ if [ "$STREAMING" = "false" ]; then
     RUN_CHECK="schedule:run"
 else
     echo "⚡ Mode: WEBSOCKET STREAMING (bot:daemon + auto-restart)"
-    # Daemon crash ho jaye to 5s baad wapis start — self-healing loop
-    docker exec -d dev sh -c 'cd /home/nodesol && while true; do php artisan bot:daemon >> /tmp/daemon.log 2>&1; echo "[$(date -u)] daemon exited ($?) — restarting in 5s" >> /tmp/daemon.log; sleep 5; done'
+    # bot-wrapper.sh use hota hai taake dashboard ka Start/Stop button bhi
+    # SAME lifecycle control kare (BOT_STOP flag respect hota hai)
+    docker exec -d dev sh -c 'rm -f /home/nodesol/storage/app/BOT_STOP; nohup sh /home/nodesol/bot-wrapper.sh >> /tmp/wrapper.log 2>&1 &'
     RUN_CHECK="bot:daemon"
 fi
 
@@ -79,8 +83,8 @@ docker exec dev php -m 2>/dev/null | grep -q gmp || OK=0
 if [ "$OK" = "1" ]; then
     echo ""
     echo "✅ BOT RUNNING!"
-    echo "   • Dashboard:  http://localhost:8000"
-    echo "   • Settings:   http://localhost:8000/settings"
+    echo "   • Dashboard:  http://localhost:8010"
+    echo "   • Settings:   http://localhost:8010/settings"
     echo "   • Band karo:  bash stop.sh"
     if [ "$RUN_CHECK" = "bot:daemon" ]; then
         echo "   • Logs:       docker exec dev tail -f /tmp/daemon.log"

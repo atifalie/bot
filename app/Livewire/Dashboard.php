@@ -8,6 +8,7 @@ use App\Models\BotState;
 use App\Models\Trade;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\Config;
 use Livewire\Component;
 
 class Dashboard extends Component
@@ -18,25 +19,45 @@ class Dashboard extends Component
 
     public ?bool $statusOk = true;
 
+    public bool $botRunning = false;
+
+    public bool $botStopping = false;
+
     public function mount(): void
     {
         $this->filterDate = today()->toDateString();
+        $this->refreshBotState();
+    }
+
+    protected function refreshBotState(): void
+    {
+        $stopping = is_file(storage_path('app/BOT_STOP'));
+        $running = self::detectDaemonProcess();
+
+        // Flag laga hai magar daemon abhi zinda = graceful exit pending
+        $this->botRunning = $running && ! $stopping;
+        $this->botStopping = $stopping && $running;
+    }
+
+    protected static function detectDaemonProcess(): bool
+    {
+        $out = @shell_exec('pgrep -f "artisan bot:daemon" 2>/dev/null');
+        $pids = array_values(array_filter(array_map('trim', explode("\n", (string) $out))));
+
+        return $pids !== [];
     }
 
     public function render()
     {
+        // Har poll (5s) pe process-list se fresh state — source of truth
+        $this->refreshBotState();
+
         $hb = Heartbeat::check();
         $hbDetails = $hb['details'] ?? [];
 
-        try {
-            $trader = app(Trader::class);
-            $trader->ensureMarkets();
-
-            $balance = Cache::remember('dash_usdt_balance', 30, fn () => $trader->getUsdtBalance());
-        } catch (\Throwable) {
-            $trader = null;
-            $balance = null;
-        }
+        // Balance + prices daemon ke Cache se padho — ZERO Bybit API calls
+        // (render() ab kabhi block nahi hoga, 504 khatam)
+        $balance = Cache::get('dash_usdt_balance');
 
         // DEMO-only positions (tracked via position_state_* keys)
         $positions = BotState::query()
@@ -48,22 +69,19 @@ class Dashboard extends Component
                 ...($s->value ?? []),
             ])
             ->values()
-            ->map(function (array $pos) use ($trader) {
+            ->map(function (array $pos) {
                 $pos['last_price'] = null;
                 $pos['pnl_pct'] = null;
                 $pos['pnl_usdt'] = null;
 
-                if (! $trader || ! isset($pos['entry_price'])) {
+                if (! isset($pos['entry_price'])) {
                     return $pos;
                 }
 
-                try {
-                    $last = Cache::remember(
-                        'dash_price_'.str_replace('/', '_', $pos['symbol']),
-                        20,
-                        fn () => $trader->getCurrentPrice($pos['symbol'])
-                    );
-                } catch (\Throwable) {
+                // Daemon ne cache mein rakha hai — read only, no API call
+                $last = Cache::get('dash_price_'.str_replace('/', '_', $pos['symbol']));
+
+                if ($last === null) {
                     return $pos;
                 }
 
@@ -110,6 +128,66 @@ class Dashboard extends Component
             ],
             'cycle' => $this->currentCycleRows(),
         ]);
+    }
+
+    public function startBot(): void
+    {
+        $this->statusMessage = null;
+
+        @unlink(storage_path('app/BOT_STOP'));
+
+        if (! self::detectDaemonProcess()) {
+            // Detached wrapper — FPM request khatam hone ke baad bhi zinda rehta hai
+            exec('nohup sh '.escapeshellarg(base_path().'/bot-wrapper.sh').' >> /tmp/wrapper.log 2>&1 &');
+            sleep(3);
+        }
+
+        $this->refreshBotState();
+        $this->statusOk = true;
+        $this->statusMessage = $this->botRunning
+            ? '▶️ Bot started — hourly scans resume (pehla scan agle candle close pe hoga).'
+            : '⏳ Start signal de diya — 5-10 sec mein processes up ho jayengi (page refresh karke dekho).';
+    }
+
+    public function stopBot(): void
+    {
+        $this->statusMessage = null;
+
+        touch(storage_path('app/BOT_STOP'));
+
+        $this->botStopping = true;
+        $this->botRunning = false;
+        $this->statusOk = true;
+        $this->statusMessage = '🛑 STOP signal — daemon ~1 min ke andar gracefully band ho jayega. ⚠️ Open positions ka SL/TP monitoring bhi band! Exchange pe wo positions waisi hi rahengi.';
+    }
+
+    public function scanNow(): void
+    {
+        $this->statusMessage = null;
+
+        try {
+            $signalPath = storage_path('app/scan_now.signal');
+
+            // Daemon ko signal bhejo — wo live WS data se foran scan karega
+            if ($this->botRunning && ! $this->botStopping) {
+                file_put_contents($signalPath, (string) time());
+                $this->statusOk = true;
+                $this->statusMessage = '⚡ Signal sent — daemon 1-2 sec mein saare coins scan karega (live WebSocket data). Neeche console mein fresh decisions dekho.';
+            } else {
+                // Daemon off hai — fallback: bot:run (REST) se manually scan
+                \Artisan::call('bot:run');
+                $this->statusOk = true;
+                $this->statusMessage = '⚡ Manual scan complete (REST fallback, daemon off) — console mein decisions dekho.';
+            }
+
+            Cache::forget('dash_usdt_balance');
+            foreach (Config::get('bot.market.symbols', []) as $s) {
+                Cache::forget('dash_price_'.str_replace('/', '_', $s));
+            }
+        } catch (\Throwable $e) {
+            $this->statusOk = false;
+            $this->statusMessage = '❌ Scan failed: '.str($e->getMessage())->limit(80);
+        }
     }
 
     public function closePosition(string $symbol): void
@@ -235,21 +313,8 @@ class Dashboard extends Component
      */
     protected function currentCycleRows(): array
     {
-        // Latest cycle start find karo (har scheduler tick "Bot v5 started" likhta hai)
-        $startTs = null;
-        $laravelLog = storage_path('logs/laravel.log');
-        if (is_file($laravelLog)) {
-            $lines = file($laravelLog, FILE_IGNORE_NEW_LINES) ?: [];
-            for ($i = count($lines) - 1; $i >= 0; $i--) {
-                if (str_contains((string) $lines[$i], 'Bot v5 started at') &&
-                    preg_match('/^\[([\d\- :]+)\]/', (string) $lines[$i], $m)) {
-                    $startTs = $m[1];
-
-                    break;
-                }
-            }
-        }
-
+        // Aaj ke saare decisions se aakhri 20 dikhata hai — restart-marker
+        // anchoring hatayi (har daemon-restart pe console blank ho jata tha).
         $path = storage_path('logs/bot_decisions-'.now()->toDateString().'.log');
         if (! is_file($path)) {
             return [];
@@ -279,12 +344,6 @@ class Dashboard extends Component
                 continue;
             }
 
-            if ($startTs !== null && $ts < $startTs) {
-                $pending = null;
-
-                continue; // purana cycle — skip
-            }
-
             $symbol = $pending['symbol'] ?? '?';
             $confidence = $pending['confidence'] ?? null;
             $pending = null;
@@ -306,6 +365,7 @@ class Dashboard extends Component
             ];
         }
 
-        return $rows;
+        // Aakhri 20 (naye pehle)
+        return array_reverse(array_slice($rows, -20));
     }
 }

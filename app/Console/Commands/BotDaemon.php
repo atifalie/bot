@@ -13,6 +13,7 @@ use App\Bot\Trading\PaperTrader;
 use App\Bot\Trading\StateStore;
 use App\Bot\Trading\SymbolCycleProcessor;
 use Illuminate\Console\Command;
+use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Config;
 use Illuminate\Support\Facades\Log;
 use React\EventLoop\Loop;
@@ -128,7 +129,15 @@ class BotDaemon extends Command
 
         // Decision driver: poll buffer each second; process symbol when its
         // LTF candle closes (new confirmed ts appears).
-        $loop->addPeriodicTimer(1.0, function () use ($processor, $fetcher, $buffer, $symbols, $timeframe, $paperMode, $paperTrader, $trader, &$usdtBalance) {
+        $scanSignal = storage_path('app/scan_now.signal');
+        $loop->addPeriodicTimer(1.0, function () use ($processor, $fetcher, $buffer, $symbols, $timeframe, $paperMode, $paperTrader, $trader, &$usdtBalance, $scanSignal) {
+            // SCAN NOW: dashboard signal file → force re-process all symbols
+            if (file_exists($scanSignal)) {
+                @unlink($scanSignal);
+                $this->lastProcessedTs = [];
+                Log::info('[Daemon] Scan signal received — force-processing all symbols');
+            }
+
             foreach ($symbols as $symbol) {
                 try {
                     $series = $buffer->ohlcv($symbol, $timeframe);
@@ -146,9 +155,17 @@ class BotDaemon extends Command
                         if (time() - $lastBalanceFetch > 60) {
                             $usdtBalance = $trader->getUsdtBalance();
                             $lastBalanceFetch = time();
+                            Cache::put('dash_usdt_balance', $usdtBalance, 120);
                         }
                     } else {
                         $usdtBalance = $paperTrader?->getSummary()['balance'] ?? 10000;
+                        Cache::put('dash_usdt_balance', $usdtBalance, 120);
+                    }
+
+                    // Dashboard ke liye live price cache karo — render() ko Bybit API call nahi karni padegi
+                    $closePrice = $series[array_key_last($series)][4] ?? null;
+                    if ($closePrice !== null) {
+                        Cache::put('dash_price_'.str_replace('/', '_', $symbol), (float) $closePrice, 120);
                     }
 
                     $this->lastProcessedTs[$symbol] = $lastTs;
@@ -176,9 +193,52 @@ class BotDaemon extends Command
 
         // Heartbeat timer — same JSON file as REST mode (dashboard reads it)
         $cycleCount = 0;
-        $loop->addPeriodicTimer(60.0, function () use (&$cycleCount, $symbols, &$usdtBalance, $paperMode, $paperTrader) {
+        $loop->addPeriodicTimer(60.0, function () use (&$cycleCount, $symbols, &$usdtBalance, $paperMode, $paperTrader, $buffer, $timeframe, $ws) {
             $cycleCount++;
+
+            // GRACEFUL STOP: dashboard ka Stop button BOT_STOP flag lagata hai.
+            // Daemon khud exit karta hai — wrapper phir flag dekh ke respawn
+            // NAHI karega. (nobody-user PHP root processes kill nahi kar sakta,
+            // is liye signal-file pattern use hota hai.)
+            if (is_file(storage_path('app/BOT_STOP'))) {
+                Log::info('[Daemon] BOT_STOP flag detected — shutting down gracefully');
+                Heartbeat::update(
+                    cycleCount: $cycleCount,
+                    activeSymbols: [],
+                    openPositions: [],
+                    balance: 0.0,
+                    status: 'stopped',
+                );
+                exit(0);
+            }
+
             try {
+                // DATA STALENESS WATCHDOG: WS silently dead ho to decisions
+                // chupchap ruk jati hain.
+                // Age CLOSE-time se naapi jati hai (start se NAHI — 1h TF pe
+                // har hour-boundary pe start-age 120min tak jayaz hoti hai,
+                // 90min threshold false-positive crash-loop karta tha).
+                // close-age > 90min = do consecutive confirms miss = dead.
+                static $lastAgeLog = 0;
+                $newest = 0;
+                foreach ($symbols as $s) {
+                    $ser = $buffer->ohlcv($s, $timeframe);
+                    if ($ser !== []) {
+                        $newest = max($newest, (int) $ser[array_key_last($ser)][0]);
+                    }
+                }
+                $closeAgeMs = $newest > 0
+                    ? ((int) (microtime(true) * 1000)) - ($newest + $this->intervalMs($timeframe))
+                    : 0;
+                if ($newest > 0 && $closeAgeMs > 5_400_000) {
+                    Log::error('[Daemon] candle data stale (closed '.round($closeAgeMs / 60_000).'min ago) — restarting daemon for fresh seed+WS');
+                    exit(1);
+                }
+                if ($cycleCount % 5 === 0 && time() - $lastAgeLog > 240) {
+                    $lastAgeLog = time();
+                    Log::info('[Daemon] health: ws_msgs='.$ws->messagesReceived.' last_candle_closed='.round(max(0, $closeAgeMs) / 60_000).'min ago');
+                }
+
                 if (! $paperMode) {
                     $usdtBalance = app(Trader::class)->getUsdtBalance();
                 } else {
@@ -195,6 +255,18 @@ class BotDaemon extends Command
                 );
             } catch (\Throwable $e) {
                 Log::warning('[Daemon] heartbeat failed: '.$e->getMessage());
+
+                // Bybit 10002 = clock-skew rejection. ccxt ka calibrated
+                // timeDifference poison ho sakta hai (galat boot-time sync) —
+                // resync karo, warna har signed call (orders/balance) fail hoti rahegi.
+                if (str_contains($e->getMessage(), '10002') || str_contains($e->getMessage(), 'recv_window')) {
+                    try {
+                        $diff = $trader->resyncServerTime();
+                        Log::info('[Daemon] server-time resynced, offset now '.round($diff / 1000, 1).'s');
+                    } catch (\Throwable $e2) {
+                        Log::warning('[Daemon] time resync failed: '.$e2->getMessage());
+                    }
+                }
             }
         });
 

@@ -29,6 +29,9 @@ class BybitWsClient
 
     public int $messagesReceived = 0;
 
+    /** Last time ANY message (data/pong) arrived — silent-connection detection */
+    public int $lastMessageAt = 0;
+
     public bool $shuttingDown = false;
 
     /** @var array<int, string> pending subscribe topics for next connect */
@@ -98,7 +101,17 @@ class BybitWsClient
             $loop->cancelTimer($timer);
         }
 
+        // Sirf ping BHEJNA kafi nahi — half-dead TCP connection pe pong kabhi
+        // nahi aata aur close event fire nahi hota (silent blindness).
+        // 2 ping-intervals tak KOI message nahi aaya → force reconnect.
         $timer = $loop->addPeriodicTimer($this->pingIntervalSeconds, function () {
+            $silentFor = time() - $this->lastMessageAt;
+            if ($this->lastMessageAt > 0 && $silentFor > $this->pingIntervalSeconds * 2) {
+                Log::warning("[Ws] silent {$silentFor}s — forcing reconnect");
+                $this->conn?->close();
+
+                return;
+            }
             $this->send(['op' => 'ping']);
         });
     }
@@ -106,6 +119,7 @@ class BybitWsClient
     public function handleRaw(string $payload): void
     {
         $this->messagesReceived++;
+        $this->lastMessageAt = time();
         if ($this->messagesReceived <= 3) {
             Log::info('[Ws] first payloads: '.substr($payload, 0, 200));
         }
